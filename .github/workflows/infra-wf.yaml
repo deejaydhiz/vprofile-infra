@@ -32,11 +32,11 @@ jobs:
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
 
-      - name: Terraform Format
-        run: terraform fmt -check -recursive
-
       - name: Terraform Init
         run: terraform init -input=false
+
+      - name: Terraform Format
+        run: terraform fmt -check -recursive
 
       - name: Terraform Validate
         run: terraform validate -no-color
@@ -44,63 +44,9 @@ jobs:
       - name: Terraform Plan
         run: terraform plan -input=false -no-color
 
-  terraform-push-plan:
-    name: Create Terraform Plan for Push
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    env:
-      TF_IN_AUTOMATION: true
-    outputs:
-      has_changes: ${{ steps.plan.outputs.has_changes }}
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-region: us-east-1
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
-
-      - name: Terraform Init
-        run: terraform init -input=false
-
-      - name: Terraform Plan
-        id: plan
-        shell: bash
-        run: |
-          if terraform plan -input=false -no-color -detailed-exitcode -out=tfplan; then
-            plan_exit_code=0
-          else
-            plan_exit_code=$?
-          fi
-
-          if [ "$plan_exit_code" -eq 0 ]; then
-            echo "has_changes=false" >> "$GITHUB_OUTPUT"
-          elif [ "$plan_exit_code" -eq 2 ]; then
-            echo "has_changes=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "Terraform plan failed with exit code $plan_exit_code" >&2
-            exit "$plan_exit_code"
-          fi
-
-      - name: Upload Terraform plan
-        if: steps.plan.outputs.has_changes == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: terraform-plan
-          path: tfplan
-          if-no-files-found: error
-          retention-days: 1
-
   terraform-apply:
     name: Terraform Apply
-    if: needs.terraform-push-plan.outputs.has_changes == 'true'
-    needs: terraform-push-plan
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     environment: terraform-apply
     env:
@@ -122,10 +68,5 @@ jobs:
       - name: Terraform Init
         run: terraform init -input=false
 
-      - name: Download Terraform plan
-        uses: actions/download-artifact@v4
-        with:
-          name: terraform-plan
-
       - name: Terraform Apply
-        run: terraform apply -input=false -no-color tfplan
+        run: terraform apply -input=false -no-color -auto-approve
