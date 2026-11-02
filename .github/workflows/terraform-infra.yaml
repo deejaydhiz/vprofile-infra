@@ -1,0 +1,113 @@
+name: "Terraform Lifecycle"
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+permissions:
+  id-token: write      # Required for secure AWS OIDC authentication
+  contents: read       # Required to pull code from checkout
+  pull-requests: write # Allows posting plan outputs directly to your PR comments
+
+jobs:
+  # JOB 1: Automatically validates and plans on Pull Requests OR pushes to main
+  terraform-plan:
+    name: "Terraform Validate & Plan"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1 
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.10.0"
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        id: plan
+        run: terraform plan -no-color -out=tfplan
+        continue-on-error: true
+
+      # Uploads the plan artifact so it can be safely used if we are on the main branch
+      - name: Upload Plan Artifact
+        if: github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: tfplan
+          retention-days: 1
+
+      # Optional: Automatically comments the plan output inside the PR for easy review
+      - name: Post Plan to PR
+        uses: actions/github-script@v7
+        if: github.event_name == 'pull_request'
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const output = `#### Terraform Plan Status: \`${{ steps.plan.outcome }}\`
+            <details><summary>Show Plan Output</summary>
+            
+            \`\`\`terraform
+            ${{ steps.plan.outputs.stdout }}
+            \`\`\`
+            
+            </details>`;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
+
+  # JOB 2: Only triggers on the main branch and forces a manual dialog button click
+  terraform-apply:
+    name: "Terraform Apply"
+    needs: terraform-plan
+    if: github.ref == 'refs/heads/main' # Enforces that apply only triggers on main branch merges
+    runs-on: ubuntu-latest
+    environment: vprofile-infra            # Enforces the manual "Review deployments" UI button click
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.10.0"
+
+      - name: Download Plan Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan
+
+      - name: Terraform Init
+        run: terraform init
+
+      # Since it is completely gated by the UI button, it is safe to auto-approve the uploaded tfplan
+      - name: Terraform Apply
+        run: terraform apply -auto-approve tfplan
