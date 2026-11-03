@@ -13,7 +13,7 @@ on:
     branches:
       - main
   schedule:
-    - cron: '0 20 * * *' # Daily drift detection run (Keep in mind this is UTC!)
+    - cron: '05 22 * * *' # Daily drift detection run (Keep in mind this is UTC!)
   workflow_dispatch: {}  # 👈 ADDS A MANUAL "RUN WORKFLOW" BUTTON TO UI TO VERIFY IMMEDIATELY
 
 permissions:
