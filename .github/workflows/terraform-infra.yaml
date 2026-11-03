@@ -4,6 +4,7 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
+# Update your triggers at the top of the file to include manual execution
 on:
   pull_request:
     branches:
@@ -12,7 +13,8 @@ on:
     branches:
       - main
   schedule:
-    - cron: '0 0 * * *' # Daily drift detection run
+    - cron: '0 20 * * *' # Daily drift detection run (Keep in mind this is UTC!)
+  workflow_dispatch: {}  # 👈 ADDS A MANUAL "RUN WORKFLOW" BUTTON TO UI TO VERIFY IMMEDIATELY
 
 permissions:
   id-token: write      
@@ -52,12 +54,37 @@ jobs:
         id: plan
         run: terraform plan -no-color -out=tfplan
 
-      # DRIFT DETECTION STEP (Runs only on schedule)
+      # # DRIFT DETECTION STEP (Runs only on schedule)
+      # - name: Terraform Plan (Drift Check)
+      #   if: github.event_name == 'schedule'
+      #   id: drift
+      #   run: |
+      #     terraform plan -detailed-exitcode -no-color || exit_code=$?
+      #     if [ ${exit_code} -eq 0 ]; then
+      #       echo "No drift detected."
+      #       exit 0
+      #     elif [ ${exit_code} -eq 2 ]; then
+      #       echo "::error::DRIFT DETECTED!"
+      #       exit 1
+      #     else
+      #       echo "::error::Terraform system error."
+      #       exit ${exit_code}
+      #     fi
+
+      # DRIFT DETECTION STEP (Fixed bash logic to catch the exit code safely)
       - name: Terraform Plan (Drift Check)
-        if: github.event_name == 'schedule'
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         id: drift
         run: |
-          terraform plan -detailed-exitcode -no-color || exit_code=$?
+          # Disable default 'fail immediately on non-zero exit codes'
+          set +e 
+          
+          terraform plan -detailed-exitcode -no-color
+          exit_code=$?
+          
+          # Re-enable standard error handling
+          set -e 
+          
           if [ ${exit_code} -eq 0 ]; then
             echo "No drift detected."
             exit 0
@@ -65,7 +92,7 @@ jobs:
             echo "::error::DRIFT DETECTED!"
             exit 1
           else
-            echo "::error::Terraform system error."
+            echo "::error::Terraform system error encountered."
             exit ${exit_code}
           fi
 
