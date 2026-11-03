@@ -1,4 +1,8 @@
-name: "Terraform Lifecycle"
+name: "Terraform Infrastructure Checks & Deployment"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
 
 on:
   pull_request:
@@ -7,14 +11,15 @@ on:
   push:
     branches:
       - main
+  schedule:
+    - cron: '0 0 * * *' # Daily drift detection run
 
 permissions:
-  id-token: write      # Required for secure AWS OIDC authentication
-  contents: read       # Required to pull code from checkout
-  pull-requests: write # Allows posting plan outputs directly to your PR comments
+  id-token: write      
+  contents: read       
+  pull-requests: write 
 
 jobs:
-  # JOB 1: Automatically validates and plans on Pull Requests OR pushes to main
   terraform-plan:
     name: "Terraform Validate & Plan"
     runs-on: ubuntu-latest
@@ -27,34 +32,51 @@ jobs:
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: us-east-1 
+          aws-region: us-east-1
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.10.0"
+          
 
       - name: Terraform Init
         run: terraform init
 
       - name: Terraform Validate
+        if: github.event_name != 'schedule'
         run: terraform validate
 
-      - name: Terraform Plan
+      - name: Terraform Plan (Standard)
+        if: github.event_name != 'schedule'
         id: plan
         run: terraform plan -no-color -out=tfplan
-        continue-on-error: true
 
-      # Uploads the plan artifact so it can be safely used if we are on the main branch
+      # DRIFT DETECTION STEP (Runs only on schedule)
+      - name: Terraform Plan (Drift Check)
+        if: github.event_name == 'schedule'
+        id: drift
+        run: |
+          terraform plan -detailed-exitcode -no-color || exit_code=$?
+          if [ ${exit_code} -eq 0 ]; then
+            echo "No drift detected."
+            exit 0
+          elif [ ${exit_code} -eq 2 ]; then
+            echo "::error::DRIFT DETECTED!"
+            exit 1
+          else
+            echo "::error::Terraform system error."
+            exit ${exit_code}
+          fi
+
       - name: Upload Plan Artifact
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' && github.event_name != 'schedule' && steps.plan.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: tfplan
           path: tfplan
           retention-days: 1
 
-      # Optional: Automatically comments the plan output inside the PR for easy review
       - name: Post Plan to PR
         uses: actions/github-script@v7
         if: github.event_name == 'pull_request'
@@ -76,13 +98,50 @@ jobs:
               body: output
             })
 
-  # JOB 2: Only triggers on the main branch and forces a manual dialog button click
+      # DYNAMIC SLACK NOTIFICATION FOR PLAN / DRIFT
+      - name: Notify Slack (Plan or Drift)
+        if: always()
+        uses: slackapi/slack-github-action@v2.0.0
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "attachments": [
+                {
+                  "color": "${{ job.status == 'success' && '#2eb886' || '#a30200' }}",
+                  "blocks": [
+                    {
+                      "type": "section",
+                      "text": {
+                        "type": "mrkdwn",
+                        "text": "${{ github.event_name == 'schedule' && '⏰ *Daily Drift Check*' || '🔨 *Terraform Plan & Validate Check*' }} completed with status: *${{ job.status }}*\n👉 *Triggered by:* @${{ github.actor }}\n👉 *Event:* `${{ github.event_name }}`"
+                      }
+                    },
+                    {
+                      "type": "actions",
+                      "elements": [
+                        {
+                          "type": "button",
+                          "text": {
+                            "type": "plain_text",
+                            "text": "View Action Log"
+                          },
+                          "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
+
   terraform-apply:
     name: "Terraform Apply"
     needs: terraform-plan
-    if: github.ref == 'refs/heads/main' # Enforces that apply only triggers on main branch merges
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
-    environment: vprofile-infra            # Enforces the manual "Review deployments" UI button click
+    environment: vprofile-infra # Forces the manual "Review deployments" UI button click
     
     steps:
       - name: Checkout Code
@@ -108,6 +167,43 @@ jobs:
       - name: Terraform Init
         run: terraform init
 
-      # Since it is completely gated by the UI button, it is safe to auto-approve the uploaded tfplan
       - name: Terraform Apply
         run: terraform apply -auto-approve tfplan
+
+      # DYNAMIC SLACK NOTIFICATION FOR APPLY
+      - name: Notify Slack (Apply)
+        if: always()
+        uses: slackapi/slack-github-action@v2.0.0
+        with:
+          webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
+          webhook-type: incoming-webhook
+          payload: |
+            {
+              "attachments": [
+                {
+                  "color": "${{ job.status == 'success' && '#2eb886' || '#a30200' }}",
+                  "blocks": [
+                    {
+                      "type": "section",
+                      "text": {
+                        "type": "mrkdwn",
+                        "text": "🚀 *Terraform Apply Deployment* finished with status: *${{ job.status }}*\n👉 *Approved & Triggered by:* @${{ github.actor }}"
+                      }
+                    },
+                    {
+                      "type": "actions",
+                      "elements": [
+                        {
+                          "type": "button",
+                          "text": {
+                            "type": "plain_text",
+                            "text": "View Deployment Logs"
+                          },
+                          "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }
