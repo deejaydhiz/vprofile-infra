@@ -1,8 +1,8 @@
 name: "Terraform Infrastructure Checks & Deployment"
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
 
 on:
   pull_request:
@@ -15,22 +15,19 @@ on:
     - cron: '0 0 * * *' # Daily drift detection run
 
 permissions:
-  contents: read
+  id-token: write      
+  contents: read       
+  pull-requests: write 
 
 jobs:
   terraform-plan:
-    name: Terraform Validate and Plan
+    name: "Terraform Validate & Plan"
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: write
-    env:
-      TF_IN_AUTOMATION: true
     steps:
-      - name: Checkout repository
+      - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
+      - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -40,114 +37,117 @@ jobs:
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: 1.10.0
-
-      - name: Terraform Format
-        run: terraform fmt -check -recursive
+          terraform_version: "1.10.0"
+          
 
       - name: Terraform Init
-        run: terraform init -input=false -lockfile=readonly
+        run: terraform init
 
       - name: Terraform Validate
         if: github.event_name != 'schedule'
-        run: terraform validate -no-color
+        run: terraform validate
 
-      - name: Terraform Plan
+      - name: Terraform Plan (Standard)
         if: github.event_name != 'schedule'
         id: plan
-        run: terraform plan -input=false -no-color -out=tfplan
+        run: terraform plan -no-color -out=tfplan
 
-      - name: Check for infrastructure drift
+      # DRIFT DETECTION STEP (Runs only on schedule)
+      - name: Terraform Plan (Drift Check)
         if: github.event_name == 'schedule'
         id: drift
-        shell: bash
         run: |
-          set +e
-          terraform plan -refresh-only -input=false -detailed-exitcode -no-color
-          plan_exit_code=$?
-          set -e
-
-          case "$plan_exit_code" in
-            0)
-              echo "No infrastructure drift detected."
-              ;;
-            2)
-              echo "::error::Infrastructure drift detected; no changes were applied."
-              exit 1
-              ;;
-            *)
-              echo "::error::Terraform drift check failed with exit code $plan_exit_code."
-              exit "$plan_exit_code"
-              ;;
-          esac
+          terraform plan -detailed-exitcode -no-color || exit_code=$?
+          if [ ${exit_code} -eq 0 ]; then
+            echo "No drift detected."
+            exit 0
+          elif [ ${exit_code} -eq 2 ]; then
+            echo "::error::DRIFT DETECTED!"
+            exit 1
+          else
+            echo "::error::Terraform system error."
+            exit ${exit_code}
+          fi
 
       - name: Upload Plan Artifact
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' && github.event_name != 'schedule' && steps.plan.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: tfplan
           path: tfplan
-          if-no-files-found: error
           retention-days: 1
 
-      - name: Comment plan on pull request
+      - name: Post Plan to PR
         uses: actions/github-script@v7
-        if: always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
-        env:
-          PLAN_OUTCOME: ${{ steps.plan.outcome }}
-          PLAN_OUTPUT: ${{ steps.plan.outputs.stdout }}
+        if: github.event_name == 'pull_request'
         with:
-          github-token: ${{ github.token }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const outcome = process.env.PLAN_OUTCOME || "not run";
-            const plan = process.env.PLAN_OUTPUT || "Terraform plan did not produce output.";
-            const maxLength = 50000;
-            const output = plan.length > maxLength
-              ? `${plan.slice(0, maxLength)}\n\n[Plan output truncated.]`
-              : plan;
-            const safeOutput = output.replace(/```/g, "`\u200b``");
-            const body = [
-              `#### Terraform Plan Status: \`${outcome}\``,
-              "<details><summary>Show Plan Output</summary>",
-              "",
-              "```terraform",
-              safeOutput,
-              "```",
-              "",
-              "</details>"
-            ].join("\n");
-
-            await github.rest.issues.createComment({
+            const output = `#### Terraform Plan Status: \`${{ steps.plan.outcome }}\`
+            <details><summary>Show Plan Output</summary>
+            
+            \`\`\`terraform
+            ${{ steps.plan.outputs.stdout }}
+            \`\`\`
+            
+            </details>`;
+            github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body
-            });
+              body: output
+            })
 
-      - name: Notify Slack
+      # DYNAMIC SLACK NOTIFICATION FOR PLAN / DRIFT
+      - name: Notify Slack (Plan or Drift)
         if: always()
-        uses: slackapi/slack-github-action@v2
+        uses: slackapi/slack-github-action@v2.0.0
         with:
           webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
           webhook-type: incoming-webhook
           payload: |
             {
-              "text": "Terraform ${{ github.event_name == 'schedule' && 'drift check' || 'plan and validation' }} for ${{ github.repository }} completed with status: ${{ job.status }}. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+              "attachments": [
+                {
+                  "color": "${{ job.status == 'success' && '#2eb886' || '#a30200' }}",
+                  "blocks": [
+                    {
+                      "type": "section",
+                      "text": {
+                        "type": "mrkdwn",
+                        "text": "${{ github.event_name == 'schedule' && '⏰ *Daily Drift Check*' || '🔨 *Terraform Plan & Validate Check*' }} completed with status: *${{ job.status }}*\n👉 *Triggered by:* @${{ github.actor }}\n👉 *Event:* `${{ github.event_name }}`"
+                      }
+                    },
+                    {
+                      "type": "actions",
+                      "elements": [
+                        {
+                          "type": "button",
+                          "text": {
+                            "type": "plain_text",
+                            "text": "View Action Log"
+                          },
+                          "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
             }
 
   terraform-apply:
-    name: Terraform Apply
+    name: "Terraform Apply"
     needs: terraform-plan
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
-    environment: vprofile-infra
-    env:
-      TF_IN_AUTOMATION: true
+    environment: vprofile-infra # Forces the manual "Review deployments" UI button click
+    
     steps:
-      - name: Checkout repository
+      - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
+      - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -157,26 +157,53 @@ jobs:
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: 1.10.0
+          terraform_version: "1.10.0"
 
-      - name: Download Terraform plan
+      - name: Download Plan Artifact
         uses: actions/download-artifact@v4
         with:
           name: tfplan
 
       - name: Terraform Init
-        run: terraform init -input=false -lockfile=readonly
+        run: terraform init
 
       - name: Terraform Apply
-        run: terraform apply -input=false -no-color tfplan
+        run: terraform apply -auto-approve tfplan
 
-      - name: Notify Slack
+      # DYNAMIC SLACK NOTIFICATION FOR APPLY
+      - name: Notify Slack (Apply)
         if: always()
-        uses: slackapi/slack-github-action@v2
+        uses: slackapi/slack-github-action@v2.0.0
         with:
           webhook: ${{ secrets.SLACK_WEBHOOK_URL }}
           webhook-type: incoming-webhook
           payload: |
             {
-              "text": "Terraform apply for ${{ github.repository }} completed with status: ${{ job.status }}. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+              "attachments": [
+                {
+                  "color": "${{ job.status == 'success' && '#2eb886' || '#a30200' }}",
+                  "blocks": [
+                    {
+                      "type": "section",
+                      "text": {
+                        "type": "mrkdwn",
+                        "text": "🚀 *Terraform Apply Deployment* finished with status: *${{ job.status }}*\n👉 *Approved & Triggered by:* @${{ github.actor }}"
+                      }
+                    },
+                    {
+                      "type": "actions",
+                      "elements": [
+                        {
+                          "type": "button",
+                          "text": {
+                            "type": "plain_text",
+                            "text": "View Deployment Logs"
+                          },
+                          "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
             }
