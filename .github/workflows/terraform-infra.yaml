@@ -12,7 +12,7 @@ on:
     branches:
       - main
   schedule:
-    - cron: '0 0 * * *' # Daily drift detection run
+    - cron: '45 12 * * *' # Daily drift detection run
 
 permissions:
   id-token: write      
