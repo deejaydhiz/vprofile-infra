@@ -12,7 +12,8 @@ on:
     branches:
       - main
   schedule:
-    - cron: '45 12 * * *' # Daily drift detection run
+    - cron: '10 22 * * *' # Daily drift detection run
+  workflow_dispatch: {}  # 👈 ADDS A MANUAL "RUN WORKFLOW" BUTTON TO UI TO VERIFY IMMEDIATELY
 
 permissions:
   id-token: write      
